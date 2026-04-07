@@ -76,6 +76,9 @@ pub enum InputContentBlock {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+    Image {
+        source: ImageSource,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,6 +86,20 @@ pub enum InputContentBlock {
 pub enum ToolResultContentBlock {
     Text { text: String },
     Json { value: Value },
+    Image { source: ImageSource },
+}
+
+/// Source for an image block sent to the Anthropic Messages API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    Base64 {
+        media_type: String,
+        data: String,
+    },
+    Url {
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

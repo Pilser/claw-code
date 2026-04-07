@@ -4,8 +4,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    max_tokens_for_model, resolve_model_alias, ContentBlockDelta, ImageSource, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
@@ -408,6 +408,19 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "path": { "type": "string" },
                     "offset": { "type": "integer", "minimum": 0 },
                     "limit": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "read_image",
+            description: "Read an image file and return it for visual analysis. Supports png, jpg, jpeg, gif, webp, bmp.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the image file to read." }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -1136,6 +1149,10 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<ReadFileInput>(input).and_then(run_read_file)
         }
+        "read_image" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ReadImageInput>(input).and_then(run_read_image)
+        }
         "write_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<WriteFileInput>(input).and_then(run_write_file)
@@ -1701,6 +1718,42 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
     to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
 }
 
+/// Encode an image file as base64 and return a JSON marker that convert_messages()
+/// will convert into an Anthropic image content block when building API requests.
+#[allow(clippy::needless_pass_by_value)]
+fn run_read_image(input: ReadImageInput) -> Result<String, String> {
+    use base64::Engine as _;
+    let path = std::path::Path::new(&input.path);
+    if !is_image_path(path) {
+        return Err(format!(
+            "Not a supported image file: {}. Supported: png, jpg, jpeg, gif, webp, bmp",
+            input.path
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("Failed to read image: {e}"))?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let media_type = match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        _ => "image/png",
+    };
+    // Return a sentinel JSON that convert_messages() recognises as an image block.
+    serde_json::to_string_pretty(&serde_json::json!({
+        "__image_block__": true,
+        "media_type": media_type,
+        "data": data
+    }))
+    .map_err(|e| e.to_string())
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
     to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
@@ -1805,6 +1858,11 @@ struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadImageInput {
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3456,13 +3514,40 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
+                    } => {
+                        // Detect image sentinel produced by run_read_image().
+                        let content =
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(output) {
+                                if v.get("__image_block__").and_then(|b| b.as_bool()) == Some(true) {
+                                    let media_type = v
+                                        .get("media_type")
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("image/png")
+                                        .to_string();
+                                    let data = v
+                                        .get("data")
+                                        .and_then(|d| d.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    vec![ToolResultContentBlock::Image {
+                                        source: ImageSource::Base64 { media_type, data },
+                                    }]
+                                } else {
+                                    vec![ToolResultContentBlock::Text {
+                                        text: output.clone(),
+                                    }]
+                                }
+                            } else {
+                                vec![ToolResultContentBlock::Text {
+                                    text: output.clone(),
+                                }]
+                            };
+                        InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content,
+                            is_error: *is_error,
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {

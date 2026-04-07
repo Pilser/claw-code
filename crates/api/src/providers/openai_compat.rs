@@ -689,6 +689,7 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                         }
                     })),
                     InputContentBlock::ToolResult { .. } => {}
+                    InputContentBlock::Image { .. } => {}
                 }
             }
             if text.is_empty() && tool_calls.is_empty() {
@@ -720,6 +721,18 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     "is_error": is_error,
                 })),
                 InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::Image { source } => {
+                    use crate::types::ImageSource;
+                    let url = match source {
+                        ImageSource::Base64 { media_type, data } =>
+                            format!("data:{media_type};base64,{data}"),
+                        ImageSource::Url { url } => url.clone(),
+                    };
+                    Some(json!({
+                        "role": "user",
+                        "content": [{ "type": "image_url", "image_url": { "url": url } }],
+                    }))
+                }
             })
             .collect(),
     }
@@ -731,6 +744,7 @@ fn flatten_tool_result_content(content: &[ToolResultContentBlock]) -> String {
         .map(|block| match block {
             ToolResultContentBlock::Text { text } => text.clone(),
             ToolResultContentBlock::Json { value } => value.to_string(),
+            ToolResultContentBlock::Image { .. } => "[image]".to_string(),
         })
         .collect::<Vec<_>>()
         .join("\n")
