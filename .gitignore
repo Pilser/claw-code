@@ -3,3 +3,4 @@ target/
 .clawd-agents/
 claw-code/
 .claude/
+claw

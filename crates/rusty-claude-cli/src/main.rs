@@ -55,6 +55,38 @@ use serde_json::json;
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+
+// ---------------------------------------------------------------------------
+// Structured output via OSC 99 envelopes
+//
+// When EDUCLAW_STRUCTURED_OUTPUT=1 the CLI emits machine-readable frames
+// alongside (or instead of) the human-readable terminal art.  educlaw-server
+// intercepts these frames before they reach xterm.js so the chat panel gets
+// clean typed events (tool_start / tool_end / chat_end / thinking) rather
+// than having to regex-parse the visual output.
+//
+// Protocol: ESC ] 99 ; <json> BEL  (\x1b]99;...\x07)
+// Same sentinel as the Python shell OSC wrapper.  The server's split_output()
+// already strips these frames from the raw terminal stream.
+// ---------------------------------------------------------------------------
+fn educlaw_structured() -> bool {
+    std::env::var("EDUCLAW_STRUCTURED_OUTPUT").is_ok_and(|v| v == "1")
+}
+
+/// Write an OSC 99 structured envelope to stdout.
+/// Silently ignores I/O errors — the envelope is best-effort.
+fn osc_emit(payload: &serde_json::Value) {
+    if !educlaw_structured() {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(payload) {
+        let _ = io::stdout().write_all(
+            format!("\x1b]99;{json}\x07").as_bytes()
+        );
+        let _ = io::stdout().flush();
+    }
+}
+
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -2132,6 +2164,7 @@ impl LiveCli {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
+        osc_emit(&json!({ "type": "thinking" }));
         spinner.tick(
             "🦀 Thinking...",
             TerminalRenderer::new().color_theme(),
@@ -2149,6 +2182,7 @@ impl LiveCli {
                     &mut stdout,
                 )?;
                 println!();
+                osc_emit(&json!({ "type": "chat_end" }));
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
@@ -2165,6 +2199,7 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                osc_emit(&json!({ "type": "chat_error", "message": error.to_string() }));
                 Err(Box::new(error))
             }
         }
@@ -4763,6 +4798,31 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
 
+    // Emit structured envelope so educlaw-server can build a typed tool card
+    // without regex-parsing the visual output.
+    let command_summary = match name {
+        "bash" | "Bash" => parsed
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "read_file" | "Read" => extract_tool_path(&parsed),
+        "write_file" | "Write" | "edit_file" | "Edit" => extract_tool_path(&parsed),
+        "glob_search" | "Glob" | "grep_search" | "Grep" => parsed
+            .get("pattern")
+            .or_else(|| parsed.get("query"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => summarize_tool_payload(input),
+    };
+    osc_emit(&json!({
+        "type": "tool_start",
+        "tool": name,
+        "command": command_summary,
+        "input": parsed,
+    }));
+
     let detail = match name {
         "bash" | "Bash" => format_bash_call(&parsed),
         "read_file" | "Read" => {
@@ -4812,12 +4872,46 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
     )
 }
 
+/// Emit an OSC tool_end envelope for educlaw-server.  Must be called AFTER
+/// the display text has been written to stdout so that the server's
+/// inside_tool gate is not lifted before the raw bytes have been consumed.
+fn osc_emit_tool_end(name: &str, output: &str, is_error: bool) {
+    let parsed: serde_json::Value =
+        serde_json::from_str(output).unwrap_or(serde_json::Value::String(output.to_string()));
+    let exit_code: i32 = if is_error {
+        1
+    } else {
+        parsed
+            .get("truncatedByExitCode")
+            .or_else(|| parsed.get("exitCode"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32
+    };
+    let stdout = parsed
+        .get("stdout")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| if is_error { "" } else { output });
+    let stderr = parsed
+        .get("stderr")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    osc_emit(&json!({
+        "type": "tool_end",
+        "tool": name,
+        "exit_code": exit_code,
+        "is_error": is_error,
+        "stdout": stdout,
+        "stderr": stderr,
+    }));
+}
+
 fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
     let icon = if is_error {
         "\x1b[1;31m✗\x1b[0m"
     } else {
         "\x1b[1;32m✓\x1b[0m"
     };
+
     if is_error {
         let summary = truncate_for_summary(output.trim(), 160);
         return if summary.is_empty() {
@@ -5380,6 +5474,10 @@ impl ToolExecutor for CliToolExecutor {
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|error| ToolError::new(error.to_string()))?;
+                    // Emit OSC tool_end AFTER display text so the server's
+                    // inside_tool gate is only lifted once the raw bytes have
+                    // already been forwarded to the terminal panel.
+                    osc_emit_tool_end(tool_name, &output, false);
                 }
                 Ok(output)
             }
@@ -5389,6 +5487,7 @@ impl ToolExecutor for CliToolExecutor {
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                    osc_emit_tool_end(tool_name, &error.to_string(), true);
                 }
                 Err(error)
             }
