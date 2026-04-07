@@ -87,6 +87,15 @@ fn osc_emit(payload: &serde_json::Value) {
     }
 }
 
+// Global flag: set true when a cancel signal arrives in structured output mode.
+// Checked each iteration of the HTTP stream loop and cleared at the start of each new turn.
+static EDUCLAW_CANCEL: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
+    std::sync::OnceLock::new();
+
+fn educlaw_cancel_flag() -> &'static std::sync::atomic::AtomicBool {
+    EDUCLAW_CANCEL.get_or_init(std::sync::atomic::AtomicBool::default)
+}
+
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -1586,7 +1595,13 @@ fn run_repl(
                     }
                 }
                 editor.push_history(input);
-                cli.run_turn(&trimmed)?;
+                match cli.run_turn(&trimmed) {
+                    Ok(()) => {}
+                    Err(e) if educlaw_structured() && e.to_string() == "cancelled" => {
+                        // Graceful cancel: chat_end already emitted by run_turn, continue.
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -2012,6 +2027,13 @@ impl HookAbortMonitor {
                 tokio::select! {
                     result = tokio::signal::ctrl_c() => {
                         if result.is_ok() {
+                            // Set the educlaw cancel flag so the HTTP stream
+                            // loop can return early on the next event, in
+                            // addition to aborting pre/post-hook runs.
+                            educlaw_cancel_flag().store(
+                                true,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
                             abort_signal.abort();
                         }
                     }
@@ -2161,27 +2183,33 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Reset cancel flag so a previous cancel does not bleed into this turn.
+        educlaw_cancel_flag().store(false, std::sync::atomic::Ordering::SeqCst);
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         osc_emit(&json!({ "type": "thinking" }));
-        spinner.tick(
-            "🦀 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        if !educlaw_structured() {
+            spinner.tick(
+                "🦀 Thinking...",
+                TerminalRenderer::new().color_theme(),
+                &mut stdout,
+            )?;
+        }
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                println!();
+                if !educlaw_structured() {
+                    spinner.finish(
+                        "✨ Done",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                    println!();
+                }
                 osc_emit(&json!({ "type": "chat_end" }));
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -2194,12 +2222,19 @@ impl LiveCli {
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                osc_emit(&json!({ "type": "chat_error", "message": error.to_string() }));
+                if !educlaw_structured() {
+                    spinner.fail(
+                        "❌ Request failed",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                }
+                // Distinguish graceful user cancel from real API/network errors.
+                if educlaw_structured() && error.to_string() == "cancelled" {
+                    osc_emit(&json!({ "type": "chat_end" }));
+                } else {
+                    osc_emit(&json!({ "type": "chat_error", "message": error.to_string() }));
+                }
                 Err(Box::new(error))
             }
         }
@@ -4542,6 +4577,9 @@ impl ApiClient for AnthropicRuntimeClient {
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?
             {
+                if educlaw_cancel_flag().load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(RuntimeError::new("cancelled"));
+                }
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
@@ -4563,7 +4601,16 @@ impl ApiClient for AnthropicRuntimeClient {
                                 if let Some(progress_reporter) = &self.progress_reporter {
                                     progress_reporter.mark_text_phase(&text);
                                 }
-                                if let Some(rendered) = markdown_stream.push(&renderer, &text) {
+                                if educlaw_structured() {
+                                    // Emit each token as an OSC envelope for the chat
+                                    // panel (true token-by-token streaming, no buffering).
+                                    // Also write the raw text to stdout so the terminal
+                                    // panel still shows a full live view of the response.
+                                    osc_emit(&json!({ "type": "assistant_text", "text": text }));
+                                    write!(out, "{text}")
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                } else if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                     write!(out, "{rendered}")
                                         .and_then(|()| out.flush())
                                         .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -4580,10 +4627,12 @@ impl ApiClient for AnthropicRuntimeClient {
                         | ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
-                        if let Some(rendered) = markdown_stream.flush(&renderer) {
-                            write!(out, "{rendered}")
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        if !educlaw_structured() {
+                            if let Some(rendered) = markdown_stream.flush(&renderer) {
+                                write!(out, "{rendered}")
+                                    .and_then(|()| out.flush())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
                         }
                         if let Some((id, name, input)) = pending_tool.take() {
                             if let Some(progress_reporter) = &self.progress_reporter {
@@ -4601,10 +4650,12 @@ impl ApiClient for AnthropicRuntimeClient {
                     }
                     ApiStreamEvent::MessageStop(_) => {
                         saw_stop = true;
-                        if let Some(rendered) = markdown_stream.flush(&renderer) {
-                            write!(out, "{rendered}")
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        if !educlaw_structured() {
+                            if let Some(rendered) = markdown_stream.flush(&renderer) {
+                                write!(out, "{rendered}")
+                                    .and_then(|()| out.flush())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
                         }
                         events.push(AssistantEvent::MessageStop);
                     }
@@ -5296,6 +5347,13 @@ fn push_output_block(
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
+                if educlaw_structured() {
+                    // Emit the raw markdown as OSC frames for the chat panel,
+                    // and write the ANSI-rendered version for the terminal panel.
+                    for token in text.split_inclusive(' ') {
+                        osc_emit(&json!({ "type": "assistant_text", "text": token }));
+                    }
+                }
                 let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
                 write!(out, "{rendered}")
                     .and_then(|()| out.flush())

@@ -459,23 +459,32 @@ impl TerminalRenderer {
         } else {
             code_language.to_string()
         };
-        let _ = writeln!(
-            output,
-            "{}",
-            format!("╭─ {label}")
-                .bold()
-                .with(self.color_theme.code_block_border)
-        );
+        if std::env::var("EDUCLAW_STRUCTURED_OUTPUT").is_ok_and(|v| v == "1") {
+            let _ = writeln!(output, "```{label}");
+        } else {
+            let _ = writeln!(
+                output,
+                "{}",
+                format!("╭─ {label}")
+                    .bold()
+                    .with(self.color_theme.code_block_border)
+            );
+        }
     }
 
     fn finish_code_block(&self, code_buffer: &str, code_language: &str, output: &mut String) {
-        output.push_str(&self.highlight_code(code_buffer, code_language));
-        let _ = write!(
-            output,
-            "{}",
-            "╰─".bold().with(self.color_theme.code_block_border)
-        );
-        output.push_str("\n\n");
+        if std::env::var("EDUCLAW_STRUCTURED_OUTPUT").is_ok_and(|v| v == "1") {
+            output.push_str(code_buffer.trim_end_matches('\n'));
+            output.push_str("\n```\n\n");
+        } else {
+            output.push_str(&self.highlight_code(code_buffer, code_language));
+            let _ = write!(
+                output,
+                "{}",
+                "╰─".bold().with(self.color_theme.code_block_border)
+            );
+            output.push_str("\n\n");
+        }
     }
 
     fn push_text(
