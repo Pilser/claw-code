@@ -91,6 +91,10 @@ pub struct SystemPromptBuilder {
     project_context: Option<ProjectContext>,
     config: Option<RuntimeConfig>,
     model_name: Option<String>,
+    /// When set, replaces the hardcoded "software engineering tasks" intro section.
+    /// Injected by educlaw-server via the EDUCLAW_SYSTEM_PROMPT env var so the
+    /// agent presents itself as a subject tutor instead of a coding assistant.
+    intro_override: Option<String>,
 }
 
 impl SystemPromptBuilder {
@@ -109,6 +113,14 @@ impl SystemPromptBuilder {
     #[must_use]
     pub fn with_model(mut self, model_name: impl Into<String>) -> Self {
         self.model_name = Some(model_name.into());
+        self
+    }
+
+    /// Override the default intro section ("software engineering tasks").
+    /// Used by educlaw-server to inject a per-student tutor persona.
+    #[must_use]
+    pub fn with_intro_override(mut self, text: impl Into<String>) -> Self {
+        self.intro_override = Some(text.into());
         self
     }
 
@@ -140,7 +152,12 @@ impl SystemPromptBuilder {
     #[must_use]
     pub fn build(&self) -> Vec<String> {
         let mut sections = Vec::new();
-        sections.push(get_simple_intro_section(self.output_style_name.is_some()));
+        // Use the educlaw tutor override if provided; fall back to the default
+        // "software engineering tasks" intro when running standalone.
+        sections.push(match &self.intro_override {
+            Some(text) => text.clone(),
+            None => get_simple_intro_section(self.output_style_name.is_some()),
+        });
         if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
             sections.push(format!("# Output Style: {name}\n{prompt}"));
         }

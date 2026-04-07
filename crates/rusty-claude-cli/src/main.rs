@@ -47,8 +47,8 @@ use runtime::{
     ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager,
     McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    ResolvedPermissionMode, RuntimeError, Session, SystemPromptBuilder, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -94,6 +94,20 @@ static EDUCLAW_CANCEL: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
 
 fn educlaw_cancel_flag() -> &'static std::sync::atomic::AtomicBool {
     EDUCLAW_CANCEL.get_or_init(std::sync::atomic::AtomicBool::default)
+}
+
+/// Returns the decoded tutor intro override from EDUCLAW_SYSTEM_PROMPT, or None.
+///
+/// educlaw-server JSON-encodes the per-student prompt and stores it in this env var
+/// before spawning claw.  When present it replaces the hardcoded
+/// "software engineering tasks" opening section so the agent presents itself as a
+/// subject tutor.  When absent (standalone claw, tests) behaviour is unchanged.
+///
+/// Encoding: the value is a JSON string literal (quoted, with \n for newlines).
+/// Readable directly in logs and in config/student.json without any decode tool.
+fn educlaw_intro_override() -> Option<String> {
+    let raw = std::env::var("EDUCLAW_SYSTEM_PROMPT").ok()?;
+    serde_json::from_str::<String>(&raw).ok()
 }
 
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -3911,13 +3925,21 @@ fn resolve_export_path(
 }
 
 fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt_for_model(
-        env::current_dir()?,
-        DEFAULT_DATE,
-        env::consts::OS,
-        "unknown",
-        Some(model),
-    )?)
+    // load_system_prompt_for_model builds via SystemPromptBuilder internally.
+    // We need to feed intro_override into it, but the public function doesn't
+    // expose that yet — so we build manually here the same way it does.
+    let cwd = env::current_dir()?;
+    let project_context = runtime::ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let config = runtime::ConfigLoader::default_for(&cwd).load()?;
+    let mut builder = runtime::SystemPromptBuilder::new()
+        .with_os(env::consts::OS, "unknown")
+        .with_project_context(project_context)
+        .with_runtime_config(config)
+        .with_model(model);
+    if let Some(intro) = educlaw_intro_override() {
+        builder = builder.with_intro_override(intro);
+    }
+    Ok(builder.build())
 }
 
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
