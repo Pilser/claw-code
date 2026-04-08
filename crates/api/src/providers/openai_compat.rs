@@ -773,7 +773,7 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
 }
 
 fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
-    matches!(config.provider_name, "OpenAI")
+    matches!(config.provider_name, "OpenAI" | "xAI")
 }
 
 fn normalize_response(
@@ -1035,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn xai_streaming_requests_skip_openai_specific_usage_opt_in() {
+    fn xai_streaming_requests_include_usage_opt_in() {
         let payload = build_chat_completion_request(
             &MessageRequest {
                 model: "grok-3".to_string(),
@@ -1049,7 +1049,7 @@ mod tests {
             OpenAiCompatConfig::xai(),
         );
 
-        assert!(payload.get("stream_options").is_none());
+        assert_eq!(payload["stream_options"], json!({"include_usage": true}));
     }
 
     #[test]

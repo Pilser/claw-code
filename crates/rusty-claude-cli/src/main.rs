@@ -2225,6 +2225,14 @@ impl LiveCli {
                     println!();
                 }
                 osc_emit(&json!({ "type": "chat_end" }));
+                osc_emit(&json!({
+                    "type": "token_usage",
+                    "input_tokens": summary.usage.input_tokens,
+                    "output_tokens": summary.usage.output_tokens,
+                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                    "model": self.model,
+                }));
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
@@ -2539,6 +2547,7 @@ impl LiveCli {
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
+        osc_emit(&json!({ "type": "model_changed", "model": model }));
         println!(
             "{}",
             format_model_switch_report(&previous, &model, message_count)

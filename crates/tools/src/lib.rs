@@ -374,6 +374,28 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
     }
 }
 
+/// Tools disabled for EduClaw student sessions.
+/// These are never sent to the model and cannot be executed.
+/// Kept: bash, read_file, read_image, write_file, edit_file, glob_search,
+///        grep_search, NotebookEdit, WebFetch, WebSearch, ToolSearch, REPL.
+const EDUCLAW_DISABLED_TOOLS: &[&str] = &[
+    // Worker & Team orchestration — not needed for student sessions
+    "WorkerCreate", "WorkerGet", "WorkerObserve", "WorkerResolveTrust",
+    "WorkerAwaitReady", "WorkerSendPrompt", "WorkerRestart", "WorkerTerminate",
+    "TeamCreate", "TeamDelete",
+    // Cron / scheduling
+    "CronCreate", "CronDelete", "CronList",
+    // Task management
+    "TodoWrite", "Agent", "Sleep", "SendUserMessage", "AskUserQuestion",
+    "TaskCreate", "TaskGet", "TaskList", "TaskStop", "TaskUpdate", "TaskOutput",
+    // MCP / remote tools
+    "ListMcpResources", "ReadMcpResource", "McpAuth", "RemoteTrigger",
+    "MCP", "TestingPermission",
+    // System / config tools
+    "Skill", "PowerShell", "LSP", "Config",
+    "EnterPlanMode", "ExitPlanMode", "StructuredOutput",
+];
+
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
@@ -1114,6 +1136,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
     ]
+    .into_iter()
+    .filter(|spec| !EDUCLAW_DISABLED_TOOLS.contains(&spec.name))
+    .collect()
 }
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
@@ -1140,6 +1165,9 @@ fn execute_tool_with_enforcer(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    if EDUCLAW_DISABLED_TOOLS.contains(&name) {
+        return Err(format!("tool `{name}` is not available in this session"));
+    }
     match name {
         "bash" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
